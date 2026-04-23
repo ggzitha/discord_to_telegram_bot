@@ -28,8 +28,8 @@ TELEGRAM_CHAT_ID   = os.getenv('TELEGRAM_CHAT_ID', '')
 # ──────────────────────────────────────────────
 # Discord Channel IDs
 # ──────────────────────────────────────────────
-PVP_CHANNEL_ID   = 717790953393487912   # /pvp channel
-HUNDO_CHANNEL_ID = 259536527221063683   # /hundo channel
+PVP_CHANNEL_ID   = 717790953393487912
+HUNDO_CHANNEL_ID = 259536527221063683
 
 # ──────────────────────────────────────────────
 # App State
@@ -37,23 +37,19 @@ HUNDO_CHANNEL_ID = 259536527221063683   # /hundo channel
 # Listening mode: 'pvp' | 'hundo' | 'both' | 'off'
 LISTEN_MODE = 'off'
 
-# Shared location filter (applies to both modes)
-CURRENT_LOCATIONS = []      # empty = ALL
+CURRENT_LOCATIONS     = []  # shared, empty = ALL
+CURRENT_CPS           = []  # PVP only, empty = ALL
+CURRENT_PVP_POKEMON   = []  # PVP only, empty = ALL
+CURRENT_HUNDO_POKEMON = []  # Hundo only, empty = ALL
 
-# PVP-only filters
-CURRENT_CPS          = []   # empty = ALL  (cp500 / cp1500 / cp2500)
-CURRENT_PVP_POKEMON  = []   # empty = ALL
-
-# Hundo-only filter
-CURRENT_HUNDO_POKEMON = []  # empty = ALL
-
-LAST_UPDATE_ID   = 0
-discord_client   = None
-discord_loop     = None
-discord_thread   = None
-discord_start_time = None
-AUTO_STOP_HOURS  = float(os.getenv('AutoStop', 0))
-APP_RUNNING      = True
+LAST_UPDATE_ID      = 0
+discord_client      = None
+discord_loop        = None
+discord_thread      = None
+discord_start_time  = None
+AUTO_STOP_HOURS     = float(os.getenv('AutoStop', 0))
+STARTUP_GRACE_SECS  = int(os.getenv('STARTUP_GRACE', 20))  # seconds to suppress msgs on connect
+APP_RUNNING         = True
 
 # ──────────────────────────────────────────────
 # Pokédex Cache
@@ -153,19 +149,25 @@ def matches_cp_filters(raw_lower):
 class PogoCoordsClient(discord.Client):
     async def on_ready(self):
         logger.info(f'Logged on as {self.user}!')
+        if STARTUP_GRACE_SECS > 0:
+            send_telegram_message(
+                TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+                f"✅ <b>Discord connected!</b> ({self.user})\n"
+                f"⏳ Forwarding paused for <b>{STARTUP_GRACE_SECS}s</b> — set your filters now!"
+            )
+            await asyncio.sleep(STARTUP_GRACE_SECS)
+            send_telegram_message(
+                TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+                "🟢 <b>Grace period over — forwarding started!</b>"
+            )
 
     async def on_message(self, message):
         channel_id = message.channel.id
 
-        # Determine which mode applies to this channel
-        if LISTEN_MODE == 'pvp'   and channel_id != PVP_CHANNEL_ID:
-            return
-        if LISTEN_MODE == 'hundo' and channel_id != HUNDO_CHANNEL_ID:
-            return
-        if LISTEN_MODE == 'both'  and channel_id not in (PVP_CHANNEL_ID, HUNDO_CHANNEL_ID):
-            return
-        if LISTEN_MODE == 'off':
-            return
+        if LISTEN_MODE == 'pvp'   and channel_id != PVP_CHANNEL_ID:   return
+        if LISTEN_MODE == 'hundo' and channel_id != HUNDO_CHANNEL_ID:  return
+        if LISTEN_MODE == 'both'  and channel_id not in (PVP_CHANNEL_ID, HUNDO_CHANNEL_ID): return
+        if LISTEN_MODE == 'off':  return
 
         is_pvp   = (channel_id == PVP_CHANNEL_ID)
         is_hundo = (channel_id == HUNDO_CHANNEL_ID)
@@ -226,9 +228,7 @@ class PogoCoordsClient(discord.Client):
             return
         logger.info(f"Scraped coords: {lat_lng}")
 
-        header  = "⚔️ <b>PvP</b> ================================================" if is_pvp \
-             else "💯 <b>Hundo</b> ==============================================="
-
+        header = "⚔️⚔️⚔️ <b>PvP</b> ⚔️⚔️⚔️" if is_pvp else "💯💯💯 <b>Hundo</b> 💯💯💯"
         final_message = build_telegram_message(raw_text, lat_lng, header)
 
         await loop.run_in_executor(
@@ -241,14 +241,28 @@ class PogoCoordsClient(discord.Client):
 # ──────────────────────────────────────────────
 def start_discord_session():
     global discord_client, discord_loop
+
+    async def runner():
+        global discord_client
+        discord_client = PogoCoordsClient()
+        try:
+            logger.info("Connecting Discord Client...")
+            await discord_client.start(DISCORD_TOKEN)
+        except Exception as e:
+            logger.error(f"Discord session stopped: {e}")
+        finally:
+            if not discord_client.is_closed():
+                await discord_client.close()
+
     discord_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(discord_loop)
-    discord_client = PogoCoordsClient()
     try:
-        logger.info("Connecting Discord Client...")
-        discord_loop.run_until_complete(discord_client.start(DISCORD_TOKEN))
-    except Exception as e:
-        logger.error(f"Discord session stopped: {e}")
+        discord_loop.run_until_complete(runner())
+    finally:
+        try:
+            discord_loop.close()
+        except Exception:
+            pass
 
 def start_discord_thread():
     global discord_thread, discord_start_time
@@ -305,7 +319,7 @@ def telegram_command_poller():
 
                     cmd = text.lower()
 
-                    # ── Mode commands ─────────────────────────
+                    # ── Mode / lifecycle commands ──────────────
                     if cmd.startswith('/pvp'):
                         LISTEN_MODE = 'pvp'
                         start_discord_thread()
@@ -324,7 +338,17 @@ def telegram_command_poller():
                         send_telegram_message(TELEGRAM_BOT_TOKEN, chat_id,
                             "⚔️💯 <b>Mode:</b> BOTH channels active")
 
-                    elif cmd.startswith('/stop-app'):
+                    elif cmd.startswith('/start_app'):
+                        if LISTEN_MODE == 'off':
+                            LISTEN_MODE = 'both'  # default to both if no prior mode set
+                        if start_discord_thread():
+                            send_telegram_message(TELEGRAM_BOT_TOKEN, chat_id,
+                                f"<b>App status:</b> DISCORD LISTENER STARTED (mode: {LISTEN_MODE})")
+                        else:
+                            send_telegram_message(TELEGRAM_BOT_TOKEN, chat_id,
+                                "<b>App status:</b> ALREADY RUNNING")
+
+                    elif cmd.startswith('/stop_app'):
                         if stop_discord_thread():
                             LISTEN_MODE = 'off'
                             send_telegram_message(TELEGRAM_BOT_TOKEN, chat_id,
@@ -334,7 +358,7 @@ def telegram_command_poller():
                                 "<b>App status:</b> ALREADY STOPPED")
 
                     # ── Pokédex update ────────────────────────
-                    elif cmd.startswith('/update-dex'):
+                    elif cmd.startswith('/update_dex'):
                         send_telegram_message(TELEGRAM_BOT_TOKEN, chat_id,
                             "<b>App status:</b> Downloading Pokédex from PokeAPI...")
                         if load_or_update_pokedex(force_update=True):
@@ -371,23 +395,22 @@ def telegram_command_poller():
 
                     # ── Generic filter parser ─────────────────
                     elif cmd.startswith('/'):
-                        raw_tokens = text[1:].replace('-', ' ')
+                        raw_tokens = text[1:].replace('_', ' ')
                         tokens     = [t.strip().lower() for t in raw_tokens.split('/') if t.strip()]
 
-                        # Hundo pokemon tokens start with "hdo "
+                        # Hundo pokemon: tokens starting with "hdo "
                         new_hundo_pokes = [t[4:].strip() for t in tokens
                                            if t.startswith('hdo ') and t[4:].strip() in VALID_POKEMON]
-                        # Remaining token classification
-                        remaining = [t for t in tokens if not t.startswith('hdo ')]
-                        new_cps           = [t for t in remaining if t.startswith('cp')]
-                        new_pvp_pokes     = [t for t in remaining if t in VALID_POKEMON]
-                        new_locs          = [t for t in remaining
-                                             if not t.startswith('cp') and t not in VALID_POKEMON]
+                        remaining     = [t for t in tokens if not t.startswith('hdo ')]
+                        new_cps       = [t for t in remaining if t.startswith('cp')]
+                        new_pvp_pokes = [t for t in remaining if t in VALID_POKEMON]
+                        new_locs      = [t for t in remaining
+                                         if not t.startswith('cp') and t not in VALID_POKEMON]
 
-                        if new_locs:          CURRENT_LOCATIONS     = new_locs
-                        if new_cps:           CURRENT_CPS           = new_cps
-                        if new_pvp_pokes:     CURRENT_PVP_POKEMON   = new_pvp_pokes
-                        if new_hundo_pokes:   CURRENT_HUNDO_POKEMON = new_hundo_pokes
+                        if new_locs:        CURRENT_LOCATIONS     = new_locs
+                        if new_cps:         CURRENT_CPS           = new_cps
+                        if new_pvp_pokes:   CURRENT_PVP_POKEMON   = new_pvp_pokes
+                        if new_hundo_pokes: CURRENT_HUNDO_POKEMON = new_hundo_pokes
 
                         loc_d   = ", ".join(f.title() for f in CURRENT_LOCATIONS)     or "ALL"
                         cp_d    = ", ".join(f.upper() for f in CURRENT_CPS)           or "ALL"
@@ -422,5 +445,5 @@ if __name__ == "__main__":
         print("IMPORTANT: Check the .env file and set your Discord user token.")
     else:
         logger.info("Initializing in STANDBY mode (mode=off).")
-        logger.info("Send /pvp, /hundo, or /both in Telegram to start listening.")
+        logger.info("Send /pvp, /hundo, /both, or /start_app in Telegram to start listening.")
         telegram_command_poller()
