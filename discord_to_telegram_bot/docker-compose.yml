@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  discord-bot:
+    build: .
+    container_name: pogo_coords_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Optional: if you want to mount scripts directly for quick dev without rebuild
+      # - .:/app
+      - /etc/localtime:/etc/localtime:ro
